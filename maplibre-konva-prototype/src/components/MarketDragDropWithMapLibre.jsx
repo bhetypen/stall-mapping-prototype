@@ -1,0 +1,851 @@
+import { useEffect, useRef, useState } from "react";
+import maplibregl from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import { Stage, Layer, Rect, Transformer, Text, Line, Circle } from "react-konva";
+import { v4 as uuidv4 } from "uuid";
+import {
+    Box, Button, TextField, Typography, Paper
+} from "@mui/material";
+import ZoomInIcon from "@mui/icons-material/ZoomIn";
+import ZoomOutIcon from "@mui/icons-material/ZoomOut";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import SaveIcon from "@mui/icons-material/Save";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
+import ImageIcon from "@mui/icons-material/Image";
+import CodeIcon from "@mui/icons-material/Code";
+
+const MAP_W = 800;
+const MAP_H = 600;
+
+// Web Mercator meters-per-pixel at a latitude
+const metersPerPixelAtLat = (lat, zoom) => {
+    const R = 6378137;
+    const WORLD_TILE_SIZE = 512;
+    return (Math.cos((lat * Math.PI) / 180) * 2 * Math.PI * R) / (WORLD_TILE_SIZE * Math.pow(2, zoom));
+};
+
+export default function MarketDragDropWithMapLibre() {
+    const mapRef = useRef(null);
+    const mapContainerRef = useRef(null);
+    const stageRef = useRef(null);
+    const transformerRef = useRef(null);
+
+
+    // View state
+    const [center, setCenter] = useState({ lat: 48.30694, lng: 14.28583 }); // Linz
+    const [zoom, setZoom] = useState(17);
+    const [bearing, setBearing] = useState(0);
+
+    // Previous view (Go Back)
+    const [prevCenter, setPrevCenter] = useState(null);
+    const [prevZoom, setPrevZoom] = useState(null);
+
+    // Saved view
+    const [zoomConfirmed, setZoomConfirmed] = useState(false);
+    const [finalLat, setFinalLat] = useState(null);
+    const [finalLng, setFinalLng] = useState(null);
+    const [finalZoom, setFinalZoom] = useState(null);
+
+    // OSM/Nominatim search
+    const [query, setQuery] = useState("Coders Bay Linz Parking Area");
+
+    // Ground-true stalls (GEO + METERS)
+    const [stalls, setStalls] = useState(() => {
+        const saved = localStorage.getItem("stalls_ground_true");
+        const arr = saved ? JSON.parse(saved) : [];
+        return arr.map(s => ({ ...s, zMeters: s.zMeters ?? 2.5 }));
+    });
+    const persist = (arr) => localStorage.setItem("stalls_ground_true", JSON.stringify(arr));
+
+    const [stallWidth, setStallWidth] = useState(2);   // meters
+    const [stallHeight, setStallHeight] = useState(3); // meters (3D extrusion height too)
+    const [newStallRotation, setNewStallRotation] = useState(45); // degrees, north-referenced
+    const [lastEditedStallId, setLastEditedStallId] = useState(null);
+    const [latestStallId, setLatestStallId] = useState(null);
+
+    const [selectedId, setSelectedId] = useState(null);
+    const [placementMode, setPlacementMode] = useState(false);
+    const [scaleBarAngle, setScaleBarAngle] = useState(48);
+
+    const metersToPixelsAt = (meters, lat) => meters / metersPerPixelAtLat(lat, zoom);
+
+    const [stallZ, setStallZ] = useState(2.5)
+
+    // ----- MapLibre init with OSM raster (no API key)
+    useEffect(() => {
+        if (!mapContainerRef.current) return;
+
+        const baseStyle = { version: 8, sources: {}, layers: [] };
+        const map = new maplibregl.Map({
+            container: mapContainerRef.current,
+            style: baseStyle,
+            center: [center.lng, center.lat],
+            zoom,
+            pitch: 80,
+            bearing: 0,
+        });
+        mapRef.current = map;
+
+        map.on("load", () => {
+            map.addSource("osm", {
+                type: "raster",
+                tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                tileSize: 256,
+                attribution: "© OpenStreetMap contributors",
+            });
+            map.addLayer({ id: "osm-basemap", type: "raster", source: "osm" });
+
+            // 3D stalls layer
+            map.addSource("stalls3d", {
+                type: "geojson",
+                data: { type: "FeatureCollection", features: [] },
+            });
+            map.addLayer({
+                id: "stalls-3d-layer",
+                type: "fill-extrusion",
+                source: "stalls3d",
+                paint: {
+                    "fill-extrusion-color": ["get", "color"],
+                    "fill-extrusion-height": ["get", "height"],
+                    "fill-extrusion-base": 0,
+                    "fill-extrusion-opacity": 0.9,
+                },
+            });
+
+            sync3DLayer();
+        });
+
+        // Keep camera state in sync
+        map.on("move", () => {
+            const c = map.getCenter();
+            if (!zoomConfirmed) {
+                setCenter({ lat: c.lat, lng: c.lng });
+                setZoom(map.getZoom());
+            }
+            setBearing(map.getBearing());
+        });
+
+        return () => {
+            map.remove();
+            mapRef.current = null;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // ----- GEO <-> Konva pixel conversions for editing overlay
+
+    const stallToPixels = (s) => {
+        const map = mapRef.current;
+        if (!map) return null;
+        // Center in screen pixels
+        const centerPx = map.project([s.lng, s.lat]); // returns {x,y} in container CSS pixels
+        // Size in pixels computed at stall latitude
+        const wPx = metersToPixelsAt(s.widthMeters, s.lat);
+        const hPx = metersToPixelsAt(s.heightMeters, s.lat);
+        return {
+            id: s.id,
+            x: centerPx.x,
+            y: centerPx.y,
+            width: wPx,
+            height: hPx,
+            rotation: s.rotation, // degrees, north-ref (screen rotation is fine for editor)
+        };
+    };
+
+    const pixelsToGeo = (nodeLike) => {
+        const map = mapRef.current;
+        if (!map) return null;
+
+        // Konva Rect is centered via offset, so node.x()/node.y() are center pixels
+        const cx = nodeLike.x;
+        const cy = nodeLike.y;
+        const centerLL = map.unproject([cx, cy]); // {lng, lat}
+
+        // Convert size in pixels back to meters at the *new* latitude
+        const mpp = metersPerPixelAtLat(centerLL.lat, zoom);
+        const wMeters = nodeLike.width * mpp;
+        const hMeters = nodeLike.height * mpp;
+
+        return {
+            lat: centerLL.lat,
+            lng: centerLL.lng,
+            widthMeters: wMeters,
+            heightMeters: hMeters,
+        };
+    };
+
+    // ----- Convert stall -> 4 corners for 3D polygon (FINAL, CONDITIONAL FIX)
+    const stallToCorners = (s) => {
+        // FIX 1: REMOVE MAP BEARING. Use ONLY the stall's rotation.
+        const theta = (Number(s.rotation) || 0) * (Math.PI / 180);
+        const cosT = Math.cos(theta);
+        const sinT = Math.sin(theta);
+
+        const halfW = Number(s.widthMeters) / 2;    // Input Width
+        const halfH = Number(s.heightMeters) / 2;   // Input Depth
+
+        // FIX 2: CONDITIONAL SWAP. Use the empirical finding that the dimensions
+        // must be swapped for latitudes above approximately 30 degrees.
+        const shouldSwap = Math.abs(s.lat) > 30;
+
+        const meterCorners = shouldSwap ? [
+            // SWAPPED for high latitudes (Austria): X=Depth, Y=Width
+            { x: -halfH, y: -halfW },
+            { x:  halfH, y: -halfW },
+            { x:  halfH, y:  halfW },
+            { x: -halfH, y:  halfW },
+        ] : [
+            // NORMAL for low latitudes (Philippines): X=Width, Y=Depth
+            { x: -halfW, y: -halfH },
+            { x:  halfW, y: -halfH },
+            { x:  halfW, y:  halfH },
+            { x: -halfW, y:  halfH },
+        ];
+
+        // FIX 3: Use the robust WGS84 calculations you implemented for correct scale.
+        const latRad = (s.lat * Math.PI) / 180;
+        const a = 6378137.0;        // WGS84 semi-major axis
+        const b = 6356752.314245;   // WGS84 semi-minor axis
+        const e2 = 1 - (b * b) / (a * a);
+
+        // Meters per degree Latitude (using Meridian Radius calculation)
+        const meridianRadius = a * (1 - e2) / Math.pow(1 - e2 * Math.sin(latRad) * Math.sin(latRad), 1.5);
+        const metersPerDegLat = (Math.PI / 180) * meridianRadius;
+
+        // Meters per degree Longitude (using Prime Vertical Radius calculation)
+        const primeVerticalRadius = a / Math.sqrt(1 - e2 * Math.sin(latRad) * Math.sin(latRad));
+        const metersPerDegLng = (Math.PI / 180) * primeVerticalRadius * Math.cos(latRad);
+
+        return meterCorners.map(({ x, y }) => {
+            // Apply rotation
+            const xr = x * cosT - y * sinT; // Rotated East meters (-> dLng)
+            const yr = x * sinT + y * cosT; // Rotated North meters (-> dLat)
+
+            // Convert to geographic coordinates
+            const dLat = yr / metersPerDegLat;
+            const dLng = xr / metersPerDegLng;
+
+            // Return [lng, lat] for GeoJSON
+            return [s.lng + dLng, s.lat + dLat];
+        });
+    };
+
+
+
+    // ----- Sync stalls -> MapLibre 3D layer (pitch-aware)
+    const sync3DLayer = () => {
+        const map = mapRef.current;
+        if (!map || !map.loaded()) return;
+
+        const features = stalls.map((s) => {
+            const coords = stallToCorners(s);
+
+            // Validate coordinates
+            if (!coords.every(coord =>
+                !isNaN(coord[0]) && !isNaN(coord[1]) &&
+                Math.abs(coord[0]) < 180 && Math.abs(coord[1]) < 90
+            )) {
+                console.error('Invalid coordinates for stall:', s.id, coords);
+                return null;
+            }
+
+            if (coords.length) coords.push(coords[0]); // close ring
+            return {
+                type: "Feature",
+                geometry: { type: "Polygon", coordinates: [coords] },
+                properties: {
+                    height: Math.max(0.1, Number(s.zMeters ?? 2.5)), // use heightMeters as extrusion height for demo
+                    color: s.id === latestStallId ? "rgb(60,180,75)" : "rgb(230,60,60)",
+                },
+            };
+        });
+
+        const src = map.getSource("stalls3d");
+        if (src) src.setData({ type: "FeatureCollection", features: features.filter(Boolean) });
+    };
+
+    // Re-sync 3D layer when anything relevant changes
+    useEffect(() => {
+        sync3DLayer();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [stalls, center, zoom, bearing, latestStallId]);
+
+    // ----- Lock/unlock map interactions
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map) return;
+        if (zoomConfirmed) {
+            map.dragPan.disable();
+            map.scrollZoom.disable();
+            map.boxZoom.disable();
+            map.dragRotate.disable();
+            map.keyboard.disable();
+            map.doubleClickZoom.disable();
+            map.touchZoomRotate.disable();
+        } else {
+            map.dragPan.enable();
+            map.scrollZoom.enable();
+            map.boxZoom.enable();
+            map.dragRotate.enable();
+            map.keyboard.enable();
+            map.doubleClickZoom.enable();
+            map.touchZoomRotate.enable();
+        }
+    }, [zoomConfirmed]);
+
+    // ----- OSM/Nominatim search
+    const searchOSM = async () => {
+        if (!query || !mapRef.current) return;
+        const res = await fetch(
+            `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`
+        );
+        const data = await res.json();
+        if (!data?.length) return alert("No results");
+        const lat = Number(data[0].lat);
+        const lng = Number(data[0].lon);
+        setPrevCenter(center);
+        setPrevZoom(zoom);
+        mapRef.current.setCenter([lng, lat]);
+        mapRef.current.setZoom(17);
+    };
+
+    // ----- Placement (click stage to add at pointer)
+    const onStageClick = (e) => {
+        if (!zoomConfirmed || !placementMode) return;
+        const stage = e.target.getStage();
+        const pos = stage.getPointerPosition();
+        if (!pos) return;
+
+        const map = mapRef.current;
+        if (!map) return;
+
+        const ll = map.unproject([pos.x, pos.y]);
+        const stall = {
+            id: uuidv4(),
+            lat: ll.lat,
+            lng: ll.lng,
+            widthMeters: Number(stallWidth),
+            heightMeters: Number(stallHeight),
+            rotation: Number(newStallRotation) || 0, // north-referenced
+            zMeters: Number(stallZ ?? 2.5)
+        };
+        setStalls((prev) => {
+            const upd = [...prev, stall];
+            persist(upd);
+            setLatestStallId(stall.id);
+            setLastEditedStallId(stall.id);
+            return upd;
+        });
+        setPlacementMode(false);
+    };
+
+    // Combined handler for selection + placement + deselection
+    const handleStageClick = (e) => {
+        const stage = e.target.getStage();
+
+        // Detect if the user clicked on an empty area (background)
+        const clickedOnEmpty = e.target === stage;
+
+        if (clickedOnEmpty) {
+            // ✅ Unselect transformer
+            setSelectedId(null);
+            const tr = transformerRef.current;
+            if (tr) {
+                tr.nodes([]);
+                tr.getLayer().batchDraw();
+            }
+
+            // Also stop placement mode if it was active accidentally
+            if (!placementMode) return;
+        }
+
+        // If placementMode is active, run existing stall placement logic
+        onStageClick(e);
+    };
+
+
+    // ----- Semi-automatic placement (ground-true, meters)
+    const addStallNext = () => {
+        if (!zoomConfirmed) return alert("Confirm the zoom level first.");
+        setStalls((prev) => {
+            let ref = null;
+            if (lastEditedStallId) ref = prev.find((s) => s.id === lastEditedStallId);
+            if (!ref && prev.length) ref = prev[prev.length - 1];
+            if (!ref) {
+                // Fallback to map center if none exists
+                const c = mapRef.current.getCenter();
+                ref = {
+                    lat: c.lat,
+                    lng: c.lng,
+                    rotation: Number(newStallRotation) || 45,
+                    widthMeters: 0
+                };
+            }
+
+            const angle = (Number(newStallRotation) * Math.PI) / 180; // north-referenced
+            const gapMeters = 0.5;
+
+            // FIX: Use stallHeight (Depth, 5m in your example) for the offset distance,
+            // as this positions the next stall along its own length.
+            const offsetLength = Number(stallHeight);
+            const offsetMeters = offsetLength + gapMeters; // e.g., 5.5m total offset
+
+            // FIX: Use more accurate WGS84 constants for conversion
+            const R_EARTH = 6378137.0;
+            const metersPerDegLat = 111133.0; // WGS84 constant
+            const metersPerDegLng = (Math.cos((ref.lat * Math.PI) / 180) * 2 * Math.PI * R_EARTH) / 360;
+
+            const east = offsetMeters * Math.cos(angle);
+            const north = offsetMeters * Math.sin(angle);
+
+            const dLng = east / metersPerDegLng;
+            const dLat = north / metersPerDegLat;
+
+            const stall = {
+                id: uuidv4(),
+                lat: ref.lat + dLat,
+                lng: ref.lng + dLng,
+                widthMeters: Number(stallWidth),
+                heightMeters: Number(stallHeight),
+                rotation: Number(newStallRotation),
+                zMeters: Number(stallZ ?? 2.5) // Keep zMeters consistent
+            };
+            const upd = [...prev, stall];
+            persist(upd);
+            setLatestStallId(stall.id);
+            setLastEditedStallId(stall.id);
+            return upd;
+        });
+    };
+
+    // ----- EDITING (drag/resize/rotate/delete) in GEO
+
+    const selectNode = (id, e) => {
+        // CRITICAL FIX: Stop event from bubbling to the Stage, which prevents deselection.
+        e?.cancelBubble && (e.cancelBubble = true);
+        setSelectedId(id);
+        setTimeout(() => {
+            const tr = transformerRef.current;
+            if (!tr) return;
+            // Use findOne to get the Konva node
+            const node = stageRef.current.findOne(`#stall-${id}`);
+            if (node) {
+                tr.nodes([node]);
+                tr.getLayer().batchDraw();
+            }
+        });
+    };
+
+    const onDragEnd = (id, e) => {
+        const node = e.target;
+        // Konva Rect center due to offsets
+        const nodeLike = {
+            x: node.x(),
+            y: node.y(),
+            width: node.width(),
+            height: node.height(),
+        };
+        const geo = pixelsToGeo(nodeLike);
+        setStalls((prev) => {
+            const upd = prev.map((s) =>
+                s.id === id ? { ...s, lat: geo.lat, lng: geo.lng } : s
+            );
+            persist(upd);
+            return upd;
+        });
+        setLastEditedStallId(id);
+    };
+
+    const onTransformEnd = (id, e) => {
+        const node = e.target;
+        const scaleX = node.scaleX();
+        const scaleY = node.scaleY();
+
+        const newW = Math.max(1, node.width() * scaleX);
+        const newH = Math.max(1, node.height() * scaleY);
+        const rot = node.rotation();
+
+        node.scaleX(1);
+        node.scaleY(1);
+
+        const nodeLike = {
+            x: node.x(),
+            y: node.y(),
+            width: newW,
+            height: newH,
+        };
+        const geo = pixelsToGeo(nodeLike);
+
+        setStalls((prev) => {
+            const upd = prev.map((s) =>
+                s.id === id ? {
+                    ...s,
+                    lat: geo.lat,
+                    lng: geo.lng,
+                    widthMeters: geo.widthMeters,
+                    heightMeters: geo.heightMeters,
+                    rotation: rot,
+                } : s
+            );
+            persist(upd);
+            return upd;
+        });
+        setLastEditedStallId(id);
+    };
+
+    const onContextDelete = (id, e) => {
+        e.evt.preventDefault();
+        setStalls((prev) => {
+            const upd = prev.filter((s) => s.id !== id);
+            persist(upd);
+            return upd;
+        });
+        if (selectedId === id) setSelectedId(null);
+    };
+
+    const setRotation = (angle) => {
+        let a = Number(angle);
+        if (Number.isNaN(a)) a = 0;
+        a = Math.max(0, Math.min(360, a));
+        setNewStallRotation(a);
+        if (selectedId) {
+            setStalls((prev) => {
+                const upd = prev.map((s) => (s.id === selectedId ? { ...s, rotation: a } : s));
+                persist(upd);
+                return upd;
+            });
+        }
+    };
+
+    // ----- Center handle to nudge map center via Konva
+    const handleRadius = 12;
+    const [handlePos, setHandlePos] = useState({ x: MAP_W / 2, y: MAP_H / 2 });
+
+    const onHandleDragEnd = (e) => {
+        const centerPx = { x: MAP_W / 2, y: MAP_H / 2 };
+        const dx = e.target.x() - centerPx.x;
+        const dy = e.target.y() - centerPx.y;
+        mapRef.current?.panBy([-dx, -dy], { animate: true });
+        setHandlePos(centerPx);
+    };
+    const onHandleDragMove = (e) => setHandlePos({ x: e.target.x(), y: e.target.y() });
+
+    // ----- Scale bar (uses ground-true meters->pixels at current center lat)
+    const scaleBar = (() => {
+        const scaleLengthMeters = 50;
+        const scaleLengthPixels = metersToPixelsAt(scaleLengthMeters, center.lat);
+        const cx = MAP_W / 2;
+        const cy = MAP_H / 2;
+        const ang = (scaleBarAngle * Math.PI) / 180;
+        const halfX = (scaleLengthPixels / 2) * Math.cos(ang);
+        const halfY = (scaleLengthPixels / 2) * Math.sin(ang);
+        const sx = cx - halfX;
+        const sy = cy - halfY;
+        const ex = cx + halfX;
+        const ey = cy + halfY;
+
+        const intervalMeters = 10;
+        const intervalPx = metersToPixelsAt(intervalMeters, center.lat);
+        const marks = [];
+        for (let i = 1; i < scaleLengthMeters / intervalMeters; i++) {
+            const d = intervalPx * i;
+            const mx = sx + d * Math.cos(ang);
+            const my = sy + d * Math.sin(ang);
+            const sz = 5;
+            const perp = ang + Math.PI / 2;
+            marks.push(
+                <Line
+                    key={`mark-${i}`}
+                    points={[
+                        mx - sz * Math.cos(perp),
+                        my - sz * Math.sin(perp),
+                        mx + sz * Math.cos(perp),
+                        my + sz * Math.sin(perp),
+                    ]}
+                    stroke="black"
+                    strokeWidth={2}
+                />
+            );
+        }
+        const textOffset = metersToPixelsAt(5, center.lat);
+        const tx = ex + textOffset * Math.cos(ang);
+        const ty = ey + textOffset * Math.sin(ang);
+        return { sx, sy, ex, ey, tx, ty, scaleLengthMeters, marks };
+    })();
+
+    // ----- Exports / Reset
+    const exportImage = () => {
+        const stage = stageRef.current;
+        if (!stage) return;
+        const dataURL = stage.toDataURL({ pixelRatio: 2, mimeType: "image/jpeg" });
+        const a = document.createElement("a");
+        a.href = dataURL; a.download = "market_map.jpeg"; a.click();
+    };
+
+    const exportHTML = () => {
+        if (!finalLat || !finalZoom) return alert("Save the zoom first.");
+        const data = stalls.map((s) => ({
+            id: s.id,
+            lat: s.lat,
+            lng: s.lng,
+            w_m: s.widthMeters,
+            h_m: s.heightMeters,
+            rot: s.rotation,
+        }));
+        const html = `<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Market Map</title></head>
+<body>
+<h2>Market Map</h2>
+<div>Center: ${finalLat?.toFixed(6)}, ${finalLng?.toFixed(6)} | Zoom: ${finalZoom?.toFixed(2)}</div>
+<pre>${JSON.stringify(data, null, 2)}</pre>
+</body></html>`;
+        const blob = new Blob([html], { type: "text/html" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "market_map.html"; a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    const resetAll = () => {
+        // Use custom modal instead of alert/confirm
+        const isConfirmed = window.prompt("Type 'RESET' to confirm deleting all data and reloading the app.") === 'RESET';
+        if (isConfirmed) {
+            localStorage.clear();
+            location.reload();
+        }
+    };
+
+    // ----- Save / Back
+    const saveFinalZoom = () => {
+        setFinalLat(center.lat);
+        setFinalLng(center.lng);
+        setFinalZoom(zoom);
+        setZoomConfirmed(true);
+    };
+    const goBack = () => {
+        if (!prevCenter) return;
+        setZoomConfirmed(false);
+        setStalls([]);
+        mapRef.current?.setCenter([prevCenter.lng, prevCenter.lat]);
+        mapRef.current?.setZoom(prevZoom ?? zoom);
+    };
+
+    const stallsInPixels = stalls.map(stallToPixels).filter(Boolean);
+
+    return (
+        <div className="p-6 bg-gray-100 min-h-screen font-sans">
+            <Typography variant="h4" className="text-gray-800 font-bold mb-4" align="center">
+                Market Stall Planner (OSM + MapLibre • Ground-True)
+            </Typography>
+
+            {/* ROW: Map (left) + Controls (right) */}
+            <Box sx={{ display: "flex", gap: 4, justifyContent: "center", alignItems: "flex-start" }}>
+                {/* LEFT: Map + Konva overlay */}
+                <Paper elevation={4} className="p-4 bg-white/90 rounded-xl shadow-2xl">
+                    <Typography variant="h6" className="text-gray-700 font-medium text-center mb-2">
+                        MapLibre • Zoom: {zoom.toFixed(2)} • Bearing: {bearing.toFixed(1)}° • Center: {center.lat.toFixed(5)}, {center.lng.toFixed(5)}
+                    </Typography>
+
+                    <div style={{ position: "relative", width: MAP_W, height: MAP_H }}>
+                        {/* MapLibre container */}
+                        <div ref={mapContainerRef} style={{ position: "absolute", inset: 0 }} />
+
+                        {/* Konva overlay */}
+                        <Stage
+                            ref={stageRef}
+                            width={MAP_W}
+                            height={MAP_H}
+                            onClick={handleStageClick}
+                            // FIX 1: Added zIndex to ensure Konva is definitively on top of MapLibre
+                            style={{ position: "absolute", inset: 0, pointerEvents: "auto", zIndex: 10 }}
+                        >
+                            <Layer>
+                                {/* Scale bar */}
+                                <>
+                                    <Line points={[scaleBar.sx, scaleBar.sy, scaleBar.ex, scaleBar.ey]} stroke="black" strokeWidth={2} opacity={0.3} />
+                                    {scaleBar.marks}
+                                    <Text x={scaleBar.tx} y={scaleBar.ty} text={`${scaleBar.scaleLengthMeters}m`} fontSize={14} fill="black" rotation={scaleBarAngle} />
+                                </>
+
+                                {/* Draggable center handle */}
+                                <>
+                                    <Line points={[MAP_W/2 - 18, MAP_H/2, MAP_W/2 + 18, MAP_H/2]} stroke="#333" strokeWidth={1} dash={[4,3]} />
+                                    <Line points={[MAP_W/2, MAP_H/2 - 18, MAP_W/2, MAP_H/2 + 18]} stroke="#333" strokeWidth={1} dash={[4,3]} />
+                                    <Circle
+                                        x={handlePos.x}
+                                        y={handlePos.y}
+                                        radius={handleRadius}
+                                        fill="#111"
+                                        opacity={0.85}
+                                        draggable
+                                        onDragMove={onHandleDragMove}
+                                        onDragEnd={onHandleDragEnd}
+                                        onMouseEnter={() => (document.body.style.cursor = "grab")}
+                                        onMouseLeave={() => (document.body.style.cursor = "default")}
+                                        onDragStart={() => (document.body.style.cursor = "grabbing")}
+                                        onDragEndCapture={() => (document.body.style.cursor = "default")}
+                                    />
+                                </>
+
+                                {/* Stalls */}
+                                {stallsInPixels.map((s) => (
+                                    <Rect
+                                        key={s.id}
+                                        id={`stall-${s.id}`}
+                                        x={s.x}
+                                        y={s.y}
+                                        width={s.width}
+                                        height={s.height}
+                                        offsetX={s.width / 2}
+                                        offsetY={s.height / 2}
+                                        fill={stalls.find(gs => gs.id === s.id)?.id === latestStallId ? "rgb(60,180,75)" : "rgb(230,60,60)"}
+                                        opacity={0.10}
+                                        // FIX 3: Stalls are only draggable when map is locked
+                                        draggable={zoomConfirmed}
+                                        rotation={s.rotation}
+                                        // FIX 2: Use onMouseDown for immediate selection/transformer attach
+                                        onMouseDown={(e) => selectNode(s.id, e)}
+                                        onTouchStart={(e) => selectNode(s.id, e)}
+                                        onDragEnd={(e) => onDragEnd(s.id, e)}
+                                        onTransformEnd={(e) => onTransformEnd(s.id, e)}
+                                        onContextMenu={(e) => onContextDelete(s.id, e)}
+                                    />
+                                ))}
+
+                                {/* Transformer */}
+                                <Transformer
+                                    ref={transformerRef}
+                                    rotateEnabled
+                                    enabledAnchors={["top-left","top-right","bottom-left","bottom-right"]}
+                                    boundBoxFunc={(oldBox, newBox) => (newBox.width < 5 || newBox.height < 5 ? oldBox : newBox)}
+                                />
+                            </Layer>
+                        </Stage>
+                    </div>
+                </Paper>
+
+                {/* RIGHT: Controls column */}
+                <Box sx={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 260 }}>
+                    {/* Search */}
+                    <Paper elevation={1} className="p-3 rounded-lg">
+                        <Typography variant="subtitle1" className="mb-2 font-semibold text-blue-600">1. Search & View</Typography>
+                        <Box sx={{ display: "flex", gap: 1 }}>
+                            <TextField
+                                fullWidth
+                                label="Search address (OSM)"
+                                size="small"
+                                value={query}
+                                onChange={(e) => setQuery(e.target.value)}
+                                onKeyDown={(e) => e.key === "Enter" && searchOSM()}
+                            />
+                            <Button variant="contained" onClick={searchOSM} className="bg-blue-500 hover:bg-blue-600">Go</Button>
+                        </Box>
+                    </Paper>
+
+                    {/* View Controls */}
+                    <Paper elevation={1} className="p-3 rounded-lg">
+                        <Typography variant="subtitle1" className="mb-2 font-semibold text-blue-600">Map Movement</Typography>
+                        <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>
+                            <Button variant="outlined" startIcon={<ZoomInIcon />} onClick={() => { setPrevCenter(center); setPrevZoom(zoom); mapRef.current?.zoomIn(); }} disabled={zoomConfirmed}>
+                                Zoom In
+                            </Button>
+                            <Button variant="outlined" startIcon={<ZoomOutIcon />} onClick={() => { setPrevCenter(center); setPrevZoom(zoom); mapRef.current?.zoomOut(); }} disabled={zoomConfirmed}>
+                                Zoom Out
+                            </Button>
+                            <Button
+                                variant="outlined"
+                                startIcon={<ArrowBackIcon />}
+                                onClick={goBack}
+                                disabled={!prevCenter || zoomConfirmed}
+                                className="col-span-2"
+                            >
+                                Go Back
+                            </Button>
+                        </Box>
+                    </Paper>
+
+                    {/* Lock/Save View */}
+                    <Paper elevation={2} className="p-3 rounded-lg bg-yellow-50">
+                        <Typography variant="subtitle1" className="mb-2 font-semibold text-yellow-800">2. Lock View</Typography>
+                        <Button
+                            fullWidth
+                            variant={zoomConfirmed ? "contained" : "outlined"}
+                            color={zoomConfirmed ? "secondary" : "primary"}
+                            onClick={saveFinalZoom}
+                            disabled={zoomConfirmed}
+                        >
+                            {zoomConfirmed ? "MAP LOCKED" : "SAVE ZOOM"}
+                        </Button>
+                        <Typography variant="caption" className="mt-1 block text-gray-600">
+                            You must lock the map before adding or moving stalls.
+                        </Typography>
+                    </Paper>
+
+                    {/* Placement Controls */}
+                    <Paper elevation={1} className="p-3 rounded-lg">
+                        <Typography variant="subtitle1" className="mb-2 font-semibold text-green-700">3. Stall Placement</Typography>
+                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                            <Button
+                                variant="contained"
+                                color="success"
+                                onClick={addStallNext}
+                                disabled={!zoomConfirmed}
+                                className="bg-green-600 hover:bg-green-700"
+                            >
+                                Add Next Stall (Auto-position)
+                            </Button>
+                            <Button
+                                variant="outlined"
+                                onClick={() => setPlacementMode(!placementMode)}
+                                disabled={!zoomConfirmed}
+                            >
+                                {placementMode ? "Cancel Placement" : "Place Stall by Click"}
+                            </Button>
+                        </Box>
+                        <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, mt: 1 }}>
+                            <TextField
+                                label="Width (m)"
+                                size="small"
+                                type="number"
+                                value={stallWidth}
+                                onChange={(e) => setStallWidth(e.target.value)}
+                            />
+                            <TextField
+                                label="Depth (m)"
+                                size="small"
+                                type="number"
+                                value={stallHeight}
+                                onChange={(e) => setStallHeight(e.target.value)}
+                            />
+                            <TextField
+                                label="Rotation (°)"
+                                size="small"
+                                type="number"
+                                value={newStallRotation}
+                                onChange={(e) => setRotation(e.target.value)}
+                                className="col-span-2"
+                            />
+                        </Box>
+                    </Paper>
+
+                    {/* Export / Reset */}
+                    <Paper elevation={1} className="p-3 rounded-lg">
+                        <Typography variant="subtitle1" className="mb-2 font-semibold text-purple-700">4. Data Management</Typography>
+                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                            <Button variant="outlined" startIcon={<ImageIcon />} onClick={exportImage}>
+                                Export Map Image
+                            </Button>
+                            <Button variant="outlined" startIcon={<CodeIcon />} onClick={exportHTML} disabled={!finalZoom}>
+                                Export GeoJSON Data
+                            </Button>
+                            <Button variant="contained" color="error" startIcon={<RestartAltIcon />} onClick={resetAll} className="bg-red-500 hover:bg-red-600">
+                                Reset All Data
+                            </Button>
+                        </Box>
+                    </Paper>
+                </Box>
+            </Box>
+        </div>
+    );
+}
